@@ -2,29 +2,18 @@ import os
 import logging
 import pandas as pd
 import google.generativeai as genai
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+import streamlit as st
+import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Get Google API key from environment variables
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# Get Google API key from Streamlit secrets
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
+
 if not GOOGLE_API_KEY or GOOGLE_API_KEY == "your_gemini_api_key_here":
-    logger.warning("No valid Google API key found in .env file. Please add your API key.")
-    # Try to read directly from .env file as fallback
-    try:
-        if os.path.exists('.env'):
-            with open('.env', 'r') as f:
-                env_contents = f.read()
-                if 'GOOGLE_API_KEY=' in env_contents:
-                    GOOGLE_API_KEY = env_contents.split('GOOGLE_API_KEY=')[1].split('\n')[0].strip()
-                    os.environ['GOOGLE_API_KEY'] = GOOGLE_API_KEY
-    except Exception as e:
-        logger.error(f"Error reading API key from .env file: {e}")
+    logger.warning("No valid Google API key found in Streamlit secrets. Please add your API key.")
 
 class GeminiAgent:
     def __init__(self, model_name="gemini-1.5-flash-latest"):
