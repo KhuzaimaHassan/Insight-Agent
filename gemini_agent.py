@@ -1,477 +1,255 @@
-import os
-import logging
-import pandas as pd
-import google.generativeai as genai
-import streamlit as st
-import logging
+"""Gemini-backed explanations with useful, clearly-labelled local fallbacks."""
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Callable
+
+import pandas as pd
+import streamlit as st
+
+
 logger = logging.getLogger(__name__)
 
-# Get Google API key from Streamlit secrets
-GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+MISSING_KEY_MESSAGE = (
+    "AI assistance is unavailable because GOOGLE_API_KEY is not configured in "
+    "Streamlit secrets. Dataset profiling, cleaning, charts, and offline report "
+    "content still work."
+)
 
-if not GOOGLE_API_KEY or GOOGLE_API_KEY == "your_gemini_api_key_here":
-    logger.warning("No valid Google API key found in Streamlit secrets. Please add your API key.")
+
+def get_google_api_key() -> str | None:
+    """Read a key without making local development depend on Streamlit secrets."""
+    try:
+        key = st.secrets.get("GOOGLE_API_KEY")
+    except Exception:
+        key = None
+    return key or os.getenv("GOOGLE_API_KEY")
+
 
 class GeminiAgent:
-    def __init__(self, model_name="gemini-1.5-flash-latest"):
-        """Initialize the agent with Gemini Flash latest model"""
-        logger.info(f"Loading Gemini model: {model_name}")
-        
-        # Flag to track initialization status
+    """Generate prose from dataset context without executing generated code."""
+
+    def __init__(
+        self,
+        model_name: str = DEFAULT_MODEL,
+        api_key: str | None = None,
+        client_factory: Callable[..., Any] | None = None,
+    ) -> None:
+        self.model_name = model_name
+        self.client: Any | None = None
         self.initialized = False
-        
+        self.status_message = MISSING_KEY_MESSAGE
+
+        key = api_key or get_google_api_key()
+        if not key or key == "your_gemini_api_key_here":
+            logger.info("Gemini is not configured; local analysis remains available.")
+            return
+
         try:
-            # Configure the API
-            if not GOOGLE_API_KEY or GOOGLE_API_KEY == "your_gemini_api_key_here":
-                logger.error("No valid Google API key found. Please set your GOOGLE_API_KEY in the .env file.")
-                self.model = None
-                self.chat = None
-                return
-                
-            genai.configure(api_key=GOOGLE_API_KEY)
-            
-            # Set default safety settings
-            self.safety_settings = [
-                {
-                    "category": "HARM_CATEGORY_HARASSMENT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_HATE_SPEECH",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                }
-            ]
-            
-            # Create the model
-            self.model = genai.GenerativeModel(
-                model_name=model_name,
-                safety_settings=self.safety_settings
+            if client_factory is None:
+                from google import genai
+
+                client_factory = genai.Client
+            self.client = client_factory(api_key=key)
+            self.initialized = True
+            self.status_message = "Gemini assistance is ready."
+            logger.info("Configured Gemini model %s", model_name)
+        except Exception:
+            logger.exception("Could not initialize the Google GenAI client")
+            self.status_message = (
+                "AI assistance could not be initialized. Dataset profiling, cleaning, "
+                "charts, and offline report content are still available."
             )
-            
-            # Test the model with a simple prompt to verify API key
-            try:
-                test_response = self.model.generate_content("Hello")
-                if not test_response or not hasattr(test_response, 'text'):
-                    raise Exception("Model response test failed")
-                
-                # Initialize chat session
-                self.chat = self.model.start_chat(history=[])
-                
-                # Mark as successfully initialized
-                self.initialized = True
-                logger.info(f"Successfully loaded Gemini model: {model_name}")
-            except Exception as e:
-                logger.error(f"Failed to test Gemini model connectivity: {e}")
-                self.model = None
-                self.chat = None
-                
-        except Exception as e:
-            logger.error(f"Error loading Gemini model: {e}")
-            self.model = None
-            self.chat = None
-    
-    def generate_data_summary(self, data_profile, df_sample):
-        """Generate a summary of the dataset"""
-        if not self.model:
-            return "Model not initialized. Please check your API key."
-        
+
+    def generate_text(self, prompt: str) -> str | None:
+        """Return provider text, retaining a safe status for UI fallback on failure."""
+        if not self.client:
+            return None
         try:
-            # Construct a description of the data
-            data_desc = f"""
-            Dataset: {data_profile['rows']} rows, {data_profile['columns']} columns.
-            Missing: {data_profile['missing_values_pct']}%
-            Numerical columns: {', '.join(data_profile['numerical_columns'][:5])}
-            Categorical columns: {', '.join(data_profile['categorical_columns'][:5])}
-            
-            Sample data: 
-            {df_sample.head(3).to_string()}
-            
-            Summarize the key characteristics of this dataset in 3-4 sentences.
-            """
-            
-            response = self.model.generate_content(data_desc)
-            return response.text
-        except Exception as e:
-            logger.error(f"Error generating summary: {e}")
-            return "Could not generate summary. Please check the data format."
-    
-    def generate_insights(self, df, visualizations, data_profile):
-        """Generate concise insights about the dataset"""
-        if not self.model:
-            return self.get_fallback_insights(df, data_profile)
-        
-        insights = []
-        
-        try:
-            # Create a more comprehensive description of the dataset
-            num_cols = data_profile.get('numerical_columns', [])[:5]  # Include more columns
-            cat_cols = data_profile.get('categorical_columns', [])[:5]
-            
-            # Basic stats for numerical columns
-            num_stats = []
-            for col in num_cols:
-                try:
-                    stats = f"{col} (min: {df[col].min():.2f}, max: {df[col].max():.2f}, mean: {df[col].mean():.2f}, median: {df[col].median():.2f})"
-                    num_stats.append(stats)
-                except:
-                    pass
-            
-            # Basic stats for categorical columns
-            cat_stats = []
-            for col in cat_cols:
-                try:
-                    # Get top 2 values for more context
-                    top_vals = df[col].value_counts().head(2)
-                    stats_parts = []
-                    for val, count in top_vals.items():
-                        pct = (count / len(df)) * 100
-                        stats_parts.append(f"'{val}': {count} ({pct:.1f}%)")
-                    
-                    stats = f"{col} (top values: {', '.join(stats_parts)})"
-                    cat_stats.append(stats)
-                except:
-                    pass
-            
-            # Add sample data rows
-            sample_data = df.head(5).to_string()
-            
-            # Create improved prompt for the model
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+            )
+            text = getattr(response, "text", None)
+            if text and text.strip():
+                return text.strip()
+            self.status_message = "Gemini returned no text. Try again or use the offline analysis."
+        except Exception:
+            logger.exception("Gemini generation failed")
+            self.status_message = (
+                "Gemini did not complete this request. Check the configured key and "
+                "provider availability, or use the offline analysis."
+            )
+        return None
+
+    def generate_data_summary(self, data_profile: dict[str, Any], df_sample: pd.DataFrame) -> str:
+        prompt = f"""
+You are a careful data analyst. Summarize this dataset in three or four concise sentences.
+Use only the supplied facts. Do not claim to have executed code or inspected rows beyond
+the sample.
+
+Rows: {data_profile['rows']}
+Columns: {data_profile['columns']}
+Missing values: {data_profile['missing_values_pct']}%
+Numerical columns: {', '.join(data_profile.get('numerical_columns', [])[:5]) or 'none'}
+Categorical columns: {', '.join(data_profile.get('categorical_columns', [])[:5]) or 'none'}
+Sample rows:
+{df_sample.head(3).to_string()}
+"""
+        return self.generate_text(prompt) or self._fallback_summary(data_profile)
+
+    def generate_insights(
+        self,
+        df: pd.DataFrame,
+        visualizations: list[Any],
+        data_profile: dict[str, Any],
+    ) -> list[str]:
+        numerical = data_profile.get("numerical_columns", [])[:5]
+        categorical = data_profile.get("categorical_columns", [])[:5]
+        number_stats = []
+        for column in numerical:
+            series = pd.to_numeric(df[column], errors="coerce").dropna()
+            if not series.empty:
+                number_stats.append(
+                    f"{column}: min={series.min():.2f}, max={series.max():.2f}, "
+                    f"mean={series.mean():.2f}, median={series.median():.2f}"
+                )
+        category_stats = []
+        for column in categorical:
+            values = df[column].dropna().value_counts().head(2)
+            if not values.empty:
+                category_stats.append(
+                    f"{column}: " + ", ".join(f"{value} ({count})" for value, count in values.items())
+                )
+
+        prompt = f"""
+Give four to five concise, data-grounded insights. Use only these facts and do not invent
+causes or business outcomes. Put one insight on each line.
+
+Dataset: {data_profile['rows']} rows, {data_profile['columns']} columns; missing values: {data_profile['missing_values_pct']}%.
+Numerical statistics:
+{chr(10).join(number_stats) or 'No usable numerical statistics.'}
+Categorical counts:
+{chr(10).join(category_stats) or 'No usable categorical counts.'}
+Sample:
+{df.head(5).to_string()}
+"""
+        text = self.generate_text(prompt)
+        if text:
+            insights = [line.strip(" -•0123456789.") for line in text.splitlines() if line.strip()]
+            if insights:
+                return insights[:5]
+        return self.get_fallback_insights(df, data_profile)
+
+    def answer_question(self, question: str, df_info: dict[str, Any]) -> str:
+        """Answer with supplied context only; Pandas snippets are suggestions."""
+        prompt = df_info.get("full_prompt")
+        if not prompt:
             prompt = f"""
-            Generate 4-5 key insights about this dataset:
-            
-            Dataset: {data_profile['rows']} rows, {data_profile['columns']} columns.
-            Missing values: {data_profile['missing_values_pct']}%
-            
-            All columns: {', '.join(df.columns.tolist())}
-            
-            Numerical columns with stats:
-            {chr(10).join(num_stats)}
-            
-            Categorical columns with distributions:
-            {chr(10).join(cat_stats)}
-            
-            Sample data (first 5 rows):
-            {sample_data}
-            
-            Each insight should be:
-            1. Data-driven and specific with actual values and statistics
-            2. Focused on patterns, outliers, or interesting relationships
-            3. Clear and direct without vague statements
-            4. Actionable where possible
-            
-            Format each insight as a separate point.
-            """
-            
-            # Get insights from the model
-            response = self.model.generate_content(prompt)
-            response_text = response.text
-            
-            # Split into separate insights
-            if '\n' in response_text:
-                model_insights = [line.strip() for line in response_text.split('\n') if line.strip()]
-            else:
-                # Split by sentences if not already formatted
-                import re
-                model_insights = re.split(r'(?<=[.!?])\s+', response_text)
-                model_insights = [insight.strip() for insight in model_insights if insight.strip()][:5]
-            
-            # Add model-generated insights
-            insights.extend(model_insights)
-            
-        except Exception as e:
-            logger.error(f"Error generating insights: {e}")
-            # Fall back to basic insights
-            return self.get_fallback_insights(df, data_profile)
-        
+Dataset: {df_info.get('rows', 'unknown')} rows, {df_info.get('columns', 'unknown')} columns.
+Numerical columns: {', '.join(df_info.get('numerical_columns', [])[:5]) or 'none'}
+Categorical columns: {', '.join(df_info.get('categorical_columns', [])[:5]) or 'none'}
+Question: {question}
+"""
+        prompt += """
+Answer only from the supplied dataset context. Do not say that code was executed. If you
+include Pandas code, label it as a suggestion and use only listed column names. State when
+the context is insufficient to answer the question.
+"""
+        text = self.generate_text(prompt)
+        if text:
+            return text
+        return (
+            f"{self.status_message}\n\n"
+            "I cannot provide an AI-generated answer right now. You can still inspect the "
+            "computed profile and charts, or configure a Google API key and try again."
+        )
+
+    def generate_recommendations(
+        self,
+        data_profile: dict[str, Any],
+        insights: list[str],
+    ) -> list[str]:
+        prompt = f"""
+Give three concise, cautious next-analysis recommendations based only on this dataset profile.
+Do not invent business context. Put one recommendation on each line.
+
+Rows: {data_profile['rows']}; columns: {data_profile['columns']}; missing values: {data_profile['missing_values_pct']}%.
+Numerical columns: {', '.join(data_profile.get('numerical_columns', [])[:5]) or 'none'}
+Categorical columns: {', '.join(data_profile.get('categorical_columns', [])[:5]) or 'none'}
+Existing insights: {' '.join(insights[:3]) or 'none'}
+"""
+        text = self.generate_text(prompt)
+        if text:
+            recommendations = [line.strip(" -•0123456789.") for line in text.splitlines() if line.strip()]
+            if recommendations:
+                return recommendations[:5]
+
+        recommendations = ["Review the dataset profile and validate column definitions before drawing conclusions."]
+        if data_profile.get("missing_values_pct", 0) > 0:
+            recommendations.append("Decide how to handle missing values and document the chosen rule.")
+        if len(data_profile.get("numerical_columns", [])) >= 2:
+            recommendations.append("Compare numerical columns with a scatter plot or correlation check before inferring relationships.")
+        if data_profile.get("categorical_columns"):
+            recommendations.append("Review category counts for rare or imbalanced values before aggregating results.")
+        return recommendations[:5]
+
+    def get_suggested_questions(self, data_profile: dict[str, Any]) -> list[str]:
+        numerical = data_profile.get("numerical_columns", [])[:2]
+        categorical = data_profile.get("categorical_columns", [])[:1]
+        prompt = f"""
+Suggest up to five short, specific questions for a dataset with numerical columns
+{', '.join(numerical) or 'none'} and categorical columns {', '.join(categorical) or 'none'}.
+Put one question per line.
+"""
+        text = self.generate_text(prompt)
+        if text:
+            questions = [line.strip(" -•0123456789.") for line in text.splitlines() if line.strip()]
+            if questions:
+                return questions[:5]
+        questions = ["What are the key patterns in this dataset?"]
+        questions.extend(f"What is the average {column}?" for column in numerical)
+        if len(numerical) >= 2:
+            questions.append(f"Is there a relationship between {numerical[0]} and {numerical[1]}?")
+        if categorical:
+            questions.append(f"What are the most common values of {categorical[0]}?")
+        return questions[:5]
+
+    @staticmethod
+    def _fallback_summary(data_profile: dict[str, Any]) -> str:
+        numerical = ", ".join(data_profile.get("numerical_columns", [])[:5]) or "no numerical columns"
+        categorical = ", ".join(data_profile.get("categorical_columns", [])[:5]) or "no categorical columns"
+        return (
+            f"This dataset contains {data_profile['rows']} rows and {data_profile['columns']} columns. "
+            f"It has {data_profile['missing_values_pct']}% missing values. "
+            f"The available numerical columns are {numerical}; categorical columns are {categorical}. "
+            "This summary was generated locally from the dataset profile."
+        )
+
+    @staticmethod
+    def get_fallback_insights(df: pd.DataFrame, data_profile: dict[str, Any]) -> list[str]:
+        insights = [
+            f"Local profile: {data_profile['rows']} rows and {data_profile['columns']} columns.",
+            (
+                f"Missing values account for {data_profile['missing_values_pct']}% of cells."
+                if data_profile.get("missing_values_pct", 0) > 0
+                else "The local profile found no missing values."
+            ),
+        ]
+        for column in data_profile.get("numerical_columns", [])[:3]:
+            series = pd.to_numeric(df[column], errors="coerce").dropna()
+            if not series.empty:
+                insights.append(
+                    f"{column} ranges from {series.min():.2f} to {series.max():.2f}, with a mean of {series.mean():.2f}."
+                )
+        for column in data_profile.get("categorical_columns", [])[:2]:
+            values = df[column].dropna().value_counts()
+            if not values.empty:
+                top_value, top_count = values.index[0], values.iloc[0]
+                insights.append(
+                    f"The most common {column} value is {top_value!r}, appearing {top_count} times."
+                )
         return insights
-    
-    def answer_question(self, question, df_info):
-        """Answer a natural language question about the data"""
-        if not self.model:
-            return "Model not initialized. Please check your Google API key in the .env file."
-        
-        try:
-            # Check if we received enhanced context format
-            if isinstance(df_info, dict) and "full_prompt" in df_info:
-                # Use the provided prompt
-                prompt = df_info["full_prompt"]
-                
-                # Add helpful analysis templates
-                prompt += """
-                
-                You can generate and execute code to analyze the data. Here are some helpful analysis templates:
-                
-                1. For calculating statistics for a column:
-                ```python
-                # For basic statistics
-                df['column_name'].describe()
-                
-                # For custom calculations
-                mean_val = df['column_name'].mean()
-                median_val = df['column_name'].median()
-                min_val = df['column_name'].min()
-                max_val = df['column_name'].max()
-                ```
-                
-                2. For grouping and aggregating data:
-                ```python
-                # Group by a categorical column and calculate mean of a numerical column
-                df.groupby('categorical_column')['numerical_column'].mean()
-                
-                # Group by multiple columns with multiple aggregations
-                df.groupby(['cat_col1', 'cat_col2']).agg({
-                    'num_col1': ['mean', 'median'],
-                    'num_col2': ['min', 'max', 'count']
-                })
-                ```
-                
-                3. For finding top/bottom values:
-                ```python
-                # Top 5 highest values in a column
-                df['column_name'].nlargest(5)
-                
-                # Bottom 5 values in a column
-                df['column_name'].nsmallest(5)
-                
-                # Top 5 groups by average value
-                df.groupby('group_column')['value_column'].mean().nlargest(5)
-                ```
-                
-                4. For correlation analysis:
-                ```python
-                # Correlation between numerical columns
-                df[['num_col1', 'num_col2', 'num_col3']].corr()
-                
-                # Correlation matrix heatmap
-                import seaborn as sns
-                sns.heatmap(df[numerical_columns].corr(), annot=True)
-                ```
-                
-                5. For categorical data analysis:
-                ```python
-                # Frequency counts
-                df['categorical_column'].value_counts()
-                
-                # Percentage distribution
-                df['categorical_column'].value_counts(normalize=True) * 100
-                
-                # Crosstab analysis
-                pd.crosstab(df['cat_col1'], df['cat_col2'])
-                
-                # Categorical column statistics by group
-                df.groupby('categorical_column')['numerical_column'].describe()
-                ```
-                
-                6. For data visualization:
-                ```python
-                # Bar chart
-                import matplotlib.pyplot as plt
-                df['categorical_column'].value_counts().plot(kind='bar')
-                plt.title('Frequency of Categories')
-                plt.xlabel('Category')
-                plt.ylabel('Count')
-                
-                # Histogram
-                plt.figure(figsize=(10, 6))
-                df['numerical_column'].hist(bins=20)
-                plt.title('Distribution of Values')
-                
-                # Scatter plot
-                plt.figure(figsize=(10, 6))
-                plt.scatter(df['x_column'], df['y_column'])
-                plt.title('Relationship between X and Y')
-                
-                # Box plot
-                plt.figure(figsize=(12, 6))
-                df.boxplot(column=['num_col1', 'num_col2', 'num_col3'])
-                plt.title('Distribution Comparison')
-                
-                # Group comparison
-                import seaborn as sns
-                plt.figure(figsize=(12, 6))
-                sns.boxplot(x='categorical_column', y='numerical_column', data=df)
-                plt.title('Values by Category')
-                ```
-                
-                Adapt the code examples above to answer the user's question using the appropriate column names from this dataset.
-                """
-                
-                # For specific analytical questions like "top N", add specialized instructions
-                if any(keyword in question.lower() for keyword in ["top", "highest", "max", "greatest", "lowest", "min"]):
-                    prompt += """
-                    
-                    If the user is asking for the top/highest/lowest values or rankings:
-                    1. Identify which column they want to rank by and which column contains the categories
-                    2. Implement a solution with pandas operations - here's a template:
-                    
-                    ```python
-                    # To find top N groups by some metric:
-                    result = df.groupby('category_column')['value_column'].AGGREGATION_FUNCTION().sort_values(ascending=False).head(N)
-                    
-                    # Example: Top 5 countries by average income
-                    top_countries = df.groupby('Country')['Income'].mean().sort_values(ascending=False).head(5)
-                    
-                    # Example: Lowest 3 products by total sales
-                    bottom_products = df.groupby('Product')['Sales'].sum().sort_values(ascending=True).head(3)
-                    ```
-                    
-                    Replace 'category_column', 'value_column', and AGGREGATION_FUNCTION with the appropriate values from the dataset.
-                    Show both the code and the results to answer the question directly.
-                    """
-            else:
-                # Construct a more compact context from dataframe info
-                num_cols = df_info.get('numerical_columns', [])[:3]
-                cat_cols = df_info.get('categorical_columns', [])[:3]
-                
-                context = f"""
-                Dataset: {df_info.get('rows', 'unknown')} rows, {df_info.get('columns', 'unknown')} columns.
-                Key numerical columns: {', '.join(num_cols)}
-                Key categorical columns: {', '.join(cat_cols)}
-                
-                Question: {question}
-                """
-                
-                prompt = f"Answer about this dataset: {context}"
-            
-            # Generate response
-            response = self.model.generate_content(prompt)
-            
-            # Handle potential null response issues (like copyright detection)
-            if not hasattr(response, 'text'):
-                # Check if finish_reason is available
-                if hasattr(response, 'candidates') and response.candidates and hasattr(response.candidates[0], 'finish_reason'):
-                    finish_reason = response.candidates[0].finish_reason
-                    if finish_reason == 4:  # Copyright material detection
-                        return """
-I can't provide a specific answer as the data may contain copyrighted material. 
-
-Try reformulating your question to be more general or analytical rather than asking for specific copyrighted content. For example:
-- Ask for statistical analysis of the data
-- Request grouping or aggregation of values
-- Ask for correlations between columns
-- Request insights or patterns in the data
-"""
-                    else:
-                        return f"I couldn't generate a complete answer. Please try rephrasing your question to be more specific about the data analysis you need."
-                else:
-                    return "I couldn't generate a response. Please try rephrasing your question in a more analytical way."
-            
-            return response.text
-            
-        except Exception as e:
-            logger.error(f"Error answering question: {e}")
-            error_message = str(e)
-            if "copyrighted material" in error_message.lower() or "finish_reason" in error_message and "4" in error_message:
-                return """
-I can't provide a specific answer as the data may contain copyrighted material. 
-
-Try reformulating your question to be more general or analytical rather than asking for specific copyrighted content. For example:
-- Ask for statistical analysis of the data
-- Request grouping or aggregation of values
-- Ask for correlations between columns
-- Request insights or patterns in the data
-"""
-            return f"I'm unable to answer this question. Please try rephrasing or check your Google API key in the .env file. Error: {str(e)}"
-    
-    def get_suggested_questions(self, data_profile):
-        """Generate suggested follow-up questions based on the data profile"""
-        if not self.model:
-            return ["What insights can you find in this data?"]
-        
-        try:
-            # Create prompt for suggested questions
-            prompt = f"""
-            Generate 5 interesting questions that could be asked about a dataset with the following characteristics:
-            
-            Dataset has {data_profile['rows']} rows and {data_profile['columns']} columns.
-            
-            Numerical columns: {', '.join(data_profile['numerical_columns'][:3])}
-            Categorical columns: {', '.join(data_profile['categorical_columns'][:3])}
-            
-            Generate specific, data-focused questions that would lead to valuable insights.
-            Make the questions concise and direct.
-            Format each question as a separate line with no numbering or bullets.
-            """
-            
-            # Get suggestions from the model
-            response = self.model.generate_content(prompt)
-            response_text = response.text
-            
-            # Process the response
-            questions = [q.strip() for q in response_text.split('\n') if q.strip()]
-            return questions[:5]  # Return top 5 questions
-            
-        except Exception as e:
-            logger.error(f"Error generating suggested questions: {e}")
-            
-            # Fallback to basic questions
-            questions = []
-            # Basic questions about the dataset
-            questions.append("What insights can you find in this data?")
-            
-            # Questions about numerical columns
-            if data_profile.get('numerical_columns'):
-                num_cols = data_profile['numerical_columns'][:2]  # Limit to top 2
-                for col in num_cols:
-                    questions.append(f"What is the average {col}?")
-                
-                if len(num_cols) >= 2:
-                    questions.append(f"Is there a relationship between {num_cols[0]} and {num_cols[1]}?")
-            
-            # Questions about categorical columns
-            if data_profile.get('categorical_columns'):
-                cat_cols = data_profile['categorical_columns'][:1]  # Limit to top 1
-                for col in cat_cols:
-                    questions.append(f"What are the most common {col} values?")
-            
-            # General analytical questions
-            questions.append("What are the key patterns in this dataset?")
-            
-            return questions[:5]  # Return top 5 questions
-
-    def get_fallback_insights(self, df, data_profile):
-        """Generate basic insights when the AI model is not available"""
-        insights = []
-        
-        # Basic dataset information
-        insights.append(f"This dataset contains {data_profile['rows']} rows and {data_profile['columns']} columns.")
-        
-        # Missing values information
-        if data_profile['missing_values_pct'] > 0:
-            insights.append(f"The dataset has {data_profile['missing_values_pct']}% missing values.")
-        else:
-            insights.append("The dataset has no missing values.")
-        
-        # Numerical columns insights
-        num_cols = data_profile.get('numerical_columns', [])[:3]
-        for col in num_cols:
-            try:
-                mean_val = df[col].mean()
-                max_val = df[col].max()
-                min_val = df[col].min()
-                insights.append(f"The column '{col}' has values ranging from {min_val:.2f} to {max_val:.2f}, with an average of {mean_val:.2f}.")
-            except:
-                pass
-        
-        # Categorical columns insights
-        cat_cols = data_profile.get('categorical_columns', [])[:3]
-        for col in cat_cols:
-            try:
-                top_category = df[col].value_counts().index[0]
-                percentage = df[col].value_counts(normalize=True).iloc[0] * 100
-                insights.append(f"The most common value in '{col}' is '{top_category}', representing {percentage:.1f}% of the data.")
-            except:
-                pass
-        
-        return insights 

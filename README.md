@@ -8,6 +8,8 @@ A Streamlit exploratory data analysis assistant for CSV and Excel datasets. Insp
 
 > **Project status:** This is a team prototype. Chat generates explanations and suggested Pandas code from supplied context; the application does not execute that generated code. Report downloads are HTML. The live Streamlit app may sleep after inactivity.
 
+See [Fix history](docs/Fix-History.md) for user-visible repairs and verification notes.
+
 ## What the application provides
 
 | Area | Implemented behavior |
@@ -16,8 +18,8 @@ A Streamlit exploratory data analysis assistant for CSV and Excel datasets. Insp
 | Data profile | Row/column counts, missing-value percentage, column types, and descriptive statistics computed with Pandas. |
 | Cleaning controls | User-selected row dropping or mean/median/mode filling; IQR-based capping for a selected numerical column. |
 | Visualizations | Automatic Plotly histograms, categorical bars/boxes, numerical scatter plots, and date-based lines when suitable columns are available. Custom scatter, bar, and histogram controls are implemented. |
-| AI insights and summary | Gemini receives summaries and sample rows to generate text. Basic fallback insights are available in the agent when the model is unavailable. |
-| Chat with data | The app supplies column names/types, numerical summaries, categorical counts, up to five sample rows, and chat history to Gemini. Responses can contain displayed Pandas code; there is no execution sandbox. |
+| AI insights and summary | The current Google GenAI SDK calls Gemini 3.5 Flash-Lite with summaries and sample rows. If the service is unavailable, the app presents clearly labelled local profile insights instead. |
+| Chat with data | The app supplies column names/types, numerical summaries, categorical counts, up to five sample rows, and chat history to Gemini. Responses can contain suggested Pandas code; the app never executes it. |
 | Report export | Downloadable HTML containing the dataset profile/statistics and available summary/insight text. PDF export and chart embedding are not implemented. |
 
 Cleaning changes the dataset held in the Streamlit session. Review the resulting row counts and values before interpreting charts or AI responses.
@@ -74,7 +76,7 @@ Create a `.streamlit` directory in the repository root, then create **`.streamli
 GOOGLE_API_KEY = "your_gemini_api_key_here"
 ```
 
-Replace the placeholder with your Google Gemini API key for AI features. The code reads `st.secrets.get("GOOGLE_API_KEY")` in [gemini_agent.py](gemini_agent.py). A `.env` file containing `GEMINI_API_KEY` does not configure this code path, even though some current UI/error messages refer to `.env`. Keep the local secrets file out of Git.
+Replace the placeholder with your Google Gemini API key for AI features. The code reads `GOOGLE_API_KEY` from Streamlit secrets first, then the same environment-variable name for local development. Keep either local value out of Git. The app uses Google's supported `google-genai` SDK and `gemini-3.5-flash-lite`; provider availability and key access still determine whether an AI request succeeds.
 
 For Streamlit Community Cloud, configure the same `GOOGLE_API_KEY` entry in the app's Secrets settings.
 
@@ -82,7 +84,7 @@ For Streamlit Community Cloud, configure the same `GOOGLE_API_KEY` entry in the 
 python -m streamlit run app.py
 ```
 
-The agent currently defaults to `gemini-1.5-flash-latest` and performs a short connectivity test during initialization. Successful AI output depends on the configured model being available to the key. This documentation update does not establish current live-model availability or migrate the provider integration. An API-key warning is not sufficient to distinguish a bad key from an unavailable model.
+The agent defaults to `gemini-3.5-flash-lite` through Google's supported `google-genai` SDK. It creates a client only when a key is configured and does not make a startup provider request. A successful request still depends on model access and provider availability; missing keys and runtime failures use clearly labelled local analysis instead.
 
 ## Try a small dataset
 
@@ -110,11 +112,11 @@ This sample is a reproducible walkthrough, not a measured model-quality benchmar
 
 - **Profiling:** The active profile uses custom Pandas functions. `ydata-profiling` is listed in requirements but is not called by the current application.
 - **Normalization:** `normalize_data` exists in [utils.py](utils.py), but there is no normalization control wired into the current UI.
-- **Report controls:** The format selector labels PDF as “Coming soon”; the download path always writes HTML. The HTML builder accepts a visualizations argument but does not use it. The recommendations request currently assigns its response without populating the list passed into the report.
+- **Report controls:** The format selector labels PDF as “Coming soon”; the download path always writes HTML. The HTML builder accepts a visualizations argument but does not use it. Selected recommendations are included in the HTML report.
 - **Visualization controls:** Box/line charts can be generated automatically, while the custom chart selector also lists choices without corresponding custom-rendering branches. The implemented custom paths are scatter, bar, and histogram.
 - **Input limits:** Empty datasets, all-missing categorical columns, or data without suitable numeric columns can cause errors in profiling/cleaning or chart controls. There is no demonstrated automatic handling of every dataset shape.
-- **AI reliability:** Answers use the supplied context and model output. There is no generated-code executor, sandbox, or benchmark establishing exact answers across arbitrary datasets. Live provider calls were not validated as part of this README correction.
-- **Dependencies:** Several reporting/profiling packages are present without an active PDF/profiling integration. The repository has no automated test suite or fully locked transitive dependency set.
+- **AI reliability:** Answers use the supplied context and model output. There is no generated-code executor, sandbox, or benchmark establishing exact answers across arbitrary datasets. When Gemini is unavailable, the app explicitly falls back to local profile insights, cautious next-analysis recommendations, and an HTML report rather than presenting an API-key error as a completed AI result.
+- **Dependencies:** Several reporting/profiling packages are present without an active PDF/profiling integration. The repository includes focused Gemini/fallback tests but no fully locked transitive dependency set.
 
 Potential next implementation work includes provider/model refresh, stronger input validation, report chart/recommendation support, and completing the custom chart controls. PDF export and a code-execution sandbox would require new implementations.
 
