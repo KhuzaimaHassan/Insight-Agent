@@ -681,7 +681,11 @@ st.markdown("<p style='text-align: center; font-size: 1.2rem; margin-bottom: 2re
 
 # Display API key error warning if needed
 if st.session_state.api_key_error:
-    st.error("⚠️ **Google Gemini API key error:** AI features are limited. Please check your API key in the .env file or make sure you have internet connectivity.")
+    st.warning(
+        "⚠️ **AI assistance is unavailable.** Add `GOOGLE_API_KEY` to this Streamlit "
+        "app's Secrets settings to enable Gemini. Dataset profiling, cleaning, charts, "
+        "local insights, and HTML reports remain available."
+    )
 
 # Use tabs for better organization with improved names
 tabs = st.tabs(["📊 Data Analysis", "💬 Chat with Data", "📝 Generate Report"])
@@ -906,14 +910,11 @@ with tabs[0]:
                 if st.button("Generate Insights", key="generate_insights_btn"):
                     with st.spinner("Analyzing data and generating insights..."):
                         try:
-                            if st.session_state.agent is None:
-                                st.error("The AI assistant is not available. Please check your API key in the .env file.")
-                            else:
-                                st.session_state.insights = st.session_state.agent.generate_insights(
-                                    st.session_state.df, 
-                                    st.session_state.visualizations, 
-                                    st.session_state.data_profile
-                                )
+                            st.session_state.insights = st.session_state.agent.generate_insights(
+                                st.session_state.df,
+                                st.session_state.visualizations,
+                                st.session_state.data_profile,
+                            )
                         except Exception as e:
                             st.error(f"Error generating insights: {str(e)}")
                 
@@ -1197,24 +1198,22 @@ with tabs[1]:
                         
                         User question: {user_input}
                         
-                        Answer with specific information from the dataset using Python/pandas code. Follow these steps:
+                        Answer with specific information from the supplied dataset context. Follow these steps:
                         1. First, understand what analysis is needed based on the question
-                        2. Show the Python/pandas code that would perform this analysis (using actual column names from this dataset)
+                        2. If useful, show Python/pandas code that a user could run (using actual column names from this dataset)
                         3. Explain what the code does in a simple way
-                        4. Provide a direct answer based on the data
+                        4. Provide a direct answer only when the supplied context supports it
+
+                        Do not claim that any suggested code was executed by this application.
                         
                         For any grouping operations, do NOT list every single group - focus on the top 5-10 results at most.
                         Keep the response concise and focused on answering the specific question.
                         """
                         
-                        # Get answer from Gemini
-                        try:
-                            if st.session_state.agent is None:
-                                response = "The AI assistant is not available. Please check your API key in the .env file."
-                            else:
-                                response = st.session_state.agent.model.generate_content(full_prompt).text
-                        except Exception as e:
-                            response = f"I encountered an error analyzing your data: {str(e)}. Please try a different question or check if your dataset is properly formatted."
+                        response = st.session_state.agent.answer_question(
+                            user_input,
+                            {"full_prompt": full_prompt},
+                        )
                         
                         # Add response to chat
                         st.session_state.chat_history.append({"role": "assistant", "content": response})
@@ -1272,7 +1271,8 @@ with tabs[2]:
                             st.session_state.data_profile
                         )
                     
-                    # Generate executive summary with Gemini if needed
+                    # Generate an executive summary when selected. The agent uses a local
+                    # profile summary if Gemini is not configured or temporarily fails.
                     executive_summary = ""
                     if include_summary:
                         try:
@@ -1284,31 +1284,14 @@ with tabs[2]:
                             st.warning(f"Could not generate summary: {str(e)}")
                             executive_summary = "Executive summary could not be generated."
                     
-                    # Generate recommendations with Gemini if needed
+                    # Generate recommendations when selected. The agent provides cautious
+                    # local recommendations if Gemini is unavailable.
                     recommendations = []
                     if include_recommendations:
-                        try:
-                            # Create prompt for recommendations
-                            prompt = f"""
-                            Based on the following dataset information, provide 3-5 actionable recommendations:
-                            
-                            Dataset has {st.session_state.data_profile['rows']} rows and {st.session_state.data_profile['columns']} columns.
-                            
-                            Numerical columns: {', '.join(st.session_state.data_profile['numerical_columns'][:5])}
-                            Categorical columns: {', '.join(st.session_state.data_profile['categorical_columns'][:5])}
-                            
-                            Key insights:
-                            {'. '.join(st.session_state.insights[:3]) if st.session_state.insights else 'No insights available.'}
-                            
-                            Provide specific, actionable recommendations for further analysis or business decisions.
-                            Each recommendation should be concise and data-driven.
-                            Format each recommendation as a separate point.
-                            """
-                            
-                            response = st.session_state.agent.model.generate_content(prompt).text
-                        except Exception as e:
-                            st.warning(f"Could not generate recommendations: {str(e)}")
-                            recommendations = ["No recommendations available."]
+                        recommendations = st.session_state.agent.generate_recommendations(
+                            st.session_state.data_profile,
+                            st.session_state.insights,
+                        )
                     
                     # Create the report
                     html_report = create_report(
